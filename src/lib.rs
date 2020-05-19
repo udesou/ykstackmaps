@@ -41,18 +41,19 @@
 // found here:
 // https://llvm.org/docs/StackMaps.html#stack-map-format
 
-extern crate elf;
 extern crate byteorder;
+extern crate elf;
+extern crate mach_object;
 
 mod errors;
 #[macro_use]
 mod util;
 
-use std::path::Path;
-use std::io::Cursor;
 use byteorder::{NativeEndian, ReadBytesExt};
 use errors::{SMParserError, SMParserResult};
-use util::{cursor_skip, cursor_align8, cursor_from_elf};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::path::Path;
+use util::{cursor_align8, cursor_from_elf, cursor_from_maco, cursor_skip, MacOFile};
 
 // We only support this version of the stackmap header for now.
 const STACKMAP_VERSION: u8 = 3;
@@ -69,8 +70,8 @@ const OFFS_STACK_SIZE_ENTRIES: u64 = 16;
 /// Represents a single stackmap record entry.
 #[derive(Debug, Eq, PartialEq)]
 pub struct SMRec {
-    pub id: u64,            // Stackmap ID.
-    pub offset: u32,        // Stackmap offset from start of containing func.
+    pub id: u64,     // Stackmap ID.
+    pub offset: u32, // Stackmap offset from start of containing func.
     pub num_locs: u16,
     pub locs: Vec<SMLoc>,
 }
@@ -101,7 +102,7 @@ pub struct SMLoc {
 #[derive(Debug, Eq, PartialEq)]
 pub enum LocOffset {
     I32(i32),
-    U32(u32)
+    U32(u32),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -110,18 +111,21 @@ pub enum LocKind {
     Direct,
     Indirect,
     Constant,
-    ConstIndex
+    ConstIndex,
 }
 
 impl LocKind {
-    fn from_hex(val: u8) -> SMParserResult<LocKind>{
+    fn from_hex(val: u8) -> SMParserResult<LocKind> {
         match val {
             0x1 => Ok(LocKind::Register),
             0x2 => Ok(LocKind::Direct),
             0x3 => Ok(LocKind::Indirect),
             0x4 => Ok(LocKind::Constant),
             0x5 => Ok(LocKind::ConstIndex),
-            x => Err(SMParserError::Other(format!("Unknown location kind '{}'", x))),
+            x => Err(SMParserError::Other(format!(
+                "Unknown location kind '{}'",
+                x
+            ))),
         }
     }
 }
@@ -141,9 +145,9 @@ impl SMRec {
 /// Represents a single function entry.
 #[derive(Debug, Eq, PartialEq)]
 pub struct SMFunc {
-    addr: u64,          // Function address.
-    stack_size: u64,    // Function's stack size.
-    record_count: u64,  // Number of stackmap records for this function.
+    addr: u64,         // Function address.
+    stack_size: u64,   // Function's stack size.
+    record_count: u64, // Number of stackmap records for this function.
 }
 
 impl SMFunc {
@@ -164,10 +168,11 @@ impl SMFunc {
 
 /// An iterator over stackmap record entries.
 pub struct SMRecIterator<'a> {
-    elf_file: &'a elf::File,
+    elf_file: Option<&'a elf::File>,
+    maco_file: Option<&'a MacOFile>,
     cursor: Option<Cursor<&'a Vec<u8>>>, // Lazily created so that creating the iterator doesn't
-                                         // need to return a `Result`.
-    start_pos: u64,                      // Start position of the cursor.
+    // need to return a `Result`.
+    start_pos: u64, // Start position of the cursor.
     num_stackmaps: u32,
 }
 
@@ -180,7 +185,20 @@ impl<'a> Iterator for SMRecIterator<'a> {
         }
 
         if self.cursor.is_none() {
-            self.cursor = Some(itry!(cursor_from_elf(self.elf_file, self.start_pos)));
+            if cfg!(target_os = "macos") {
+                self.cursor = Some(itry!(cursor_from_maco(
+                    self.maco_file.unwrap(),
+                    self.start_pos,
+                    false
+                )));
+            } else if cfg!(target_os = "linux") {
+                self.cursor = Some(itry!(cursor_from_elf(
+                    self.elf_file.unwrap(),
+                    self.start_pos
+                )));
+            } else {
+                panic!("OS unsupported.");
+            }
         }
         let mut cursor = self.cursor.as_mut().unwrap();
 
@@ -198,12 +216,14 @@ impl<'a> Iterator for SMRecIterator<'a> {
 
         //     uint16: NumLocations
         let num_locs = itry!(cursor.read_u16::<NativeEndian>());
+
         //     Location[NumLocations] { ... }
         let loc_iter = SMLocIterator {
             elf_file: self.elf_file,
+            maco_file: self.maco_file,
             cursor: None,
             start_pos: cursor.position(),
-            num_locs: num_locs
+            num_locs: num_locs,
         };
 
         let mut locs = Vec::with_capacity(num_locs as usize);
@@ -230,15 +250,21 @@ impl<'a> Iterator for SMRecIterator<'a> {
         // } -- End of this stackmap record.
 
         self.num_stackmaps -= 1;
-        Some(Ok(SMRec { id, offset, num_locs, locs }))
+        Some(Ok(SMRec {
+            id,
+            offset,
+            num_locs,
+            locs,
+        }))
     }
 }
 
 struct SMLocIterator<'a> {
-    elf_file: &'a elf::File,
+    elf_file: Option<&'a elf::File>,
+    maco_file: Option<&'a MacOFile>,
     cursor: Option<Cursor<&'a Vec<u8>>>,
     start_pos: u64,
-    num_locs: u16
+    num_locs: u16,
 }
 
 impl<'a> Iterator for SMLocIterator<'a> {
@@ -250,7 +276,20 @@ impl<'a> Iterator for SMLocIterator<'a> {
         }
 
         if self.cursor.is_none() {
-            self.cursor = Some(itry!(cursor_from_elf(self.elf_file, self.start_pos)));
+            if cfg!(target_os = "macos") {
+                self.cursor = Some(itry!(cursor_from_maco(
+                    self.maco_file.unwrap(),
+                    self.start_pos,
+                    true
+                )));
+            } else if cfg!(target_os = "linux") {
+                self.cursor = Some(itry!(cursor_from_elf(
+                    self.elf_file.unwrap(),
+                    self.start_pos
+                )));
+            } else {
+                panic!("OS unsupported.");
+            }
         }
 
         let cursor = self.cursor.as_mut().unwrap();
@@ -258,6 +297,7 @@ impl<'a> Iterator for SMLocIterator<'a> {
         //     uint8: Register | Direct | Indirect | Constant | ConstIndex
         let kind = itry!(cursor.read_u8());
         let kind = itry!(LocKind::from_hex(kind));
+
         //     uint8: Reserved (expected to be 0)
         assert_eq!(itry!(cursor.read_u8()), 0);
         //     uint16: Location Size
@@ -271,23 +311,29 @@ impl<'a> Iterator for SMLocIterator<'a> {
             LocKind::Constant => {
                 let v = itry!(cursor.read_u32::<NativeEndian>());
                 LocOffset::U32(v)
-            },
+            }
             _ => {
                 let v = itry!(cursor.read_i32::<NativeEndian>());
                 LocOffset::I32(v)
             }
         };
         self.num_locs -= 1;
-        Some(Ok(SMLoc { kind, size, dwarf_reg, offset }))
+        Some(Ok(SMLoc {
+            kind,
+            size,
+            dwarf_reg,
+            offset,
+        }))
     }
 }
 
 /// An iterator over function entries.
 pub struct SMFuncIterator<'a> {
-    elf_file: &'a elf::File,
+    elf_file: Option<&'a elf::File>,
+    maco_file: Option<&'a MacOFile>,
     cursor: Option<Cursor<&'a Vec<u8>>>, // Lazily created so that creating the iterator doesn't
-                                         // need to return a `Result`.
-    start_pos: u64,                      // Start position of the cursor.
+    // need to return a `Result`.
+    start_pos: u64, // Start position of the cursor.
     num_funcs: u32,
 }
 
@@ -300,7 +346,20 @@ impl<'a> Iterator for SMFuncIterator<'a> {
         }
 
         if self.cursor.is_none() {
-            self.cursor = Some(itry!(cursor_from_elf(self.elf_file, self.start_pos)));
+            if cfg!(target_os = "macos") {
+                self.cursor = Some(itry!(cursor_from_maco(
+                    self.maco_file.unwrap(),
+                    self.start_pos,
+                    false
+                )));
+            } else if cfg!(target_os = "linux") {
+                self.cursor = Some(itry!(cursor_from_elf(
+                    self.elf_file.unwrap(),
+                    self.start_pos
+                )));
+            } else {
+                panic!("OS unsupported.");
+            }
         }
         let cursor = self.cursor.as_mut().unwrap();
 
@@ -314,13 +373,18 @@ impl<'a> Iterator for SMFuncIterator<'a> {
         // } -- End of this function entry.
 
         self.num_funcs -= 1;
-        Some(Ok(SMFunc{addr, stack_size, record_count}))
+        Some(Ok(SMFunc {
+            addr,
+            stack_size,
+            record_count,
+        }))
     }
 }
 
 /// Top-level struct through which the user interfaces with the stackmap section.
 pub struct StackMapParser {
-    elf_file: elf::File,
+    elf_file: Option<elf::File>,
+    maco_file: Option<MacOFile>,
     num_funcs: u32,
     num_consts: u32,
     num_stackmaps: u32,
@@ -328,12 +392,41 @@ pub struct StackMapParser {
 
 impl StackMapParser {
     pub fn new(path: &Path) -> SMParserResult<Self> {
-        let elf_file = elf::File::open_path(path)?;
         let num_funcs;
         let num_consts;
         let num_stackmaps;
-        {
-            let mut cursor = cursor_from_elf(&elf_file, 0)?;
+
+        if cfg!(target_os = "linux") {
+            let elf_file = elf::File::open_path(path)?;
+            {
+                let mut cursor = cursor_from_elf(&elf_file, 0)?;
+                Self::check_header(&mut cursor)?;
+
+                // Read in table sizes.
+                // uint32: NumFunctions
+                num_funcs = cursor.read_u32::<NativeEndian>()?;
+                // uint32: NumConstants
+                num_consts = cursor.read_u32::<NativeEndian>()?;
+                // uint32: NumRecords
+                num_stackmaps = cursor.read_u32::<NativeEndian>()?;
+            }
+
+            Ok(Self {
+                elf_file: Some(elf_file),
+                num_funcs,
+                maco_file: None,
+                num_consts,
+                num_stackmaps,
+            })
+        } else if cfg!(target_os = "macos") {
+            use std::fs::File;
+            use std::io::{self, Cursor, Read, Seek, SeekFrom};
+
+            let mut maco_file = MacOFile { buf: Vec::new() };
+            let mut file = File::open(path)?;
+            let size = file.read_to_end(&mut maco_file.buf).unwrap();
+
+            let mut cursor = cursor_from_maco(&maco_file, 0, false)?;
             Self::check_header(&mut cursor)?;
 
             // Read in table sizes.
@@ -343,9 +436,21 @@ impl StackMapParser {
             num_consts = cursor.read_u32::<NativeEndian>()?;
             // uint32: NumRecords
             num_stackmaps = cursor.read_u32::<NativeEndian>()?;
-        }
 
-        Ok(Self{elf_file, num_funcs, num_consts, num_stackmaps})
+            println!(
+                "fns = {}, consts = {}, stms = {}",
+                num_funcs, num_consts, num_stackmaps
+            );
+            Ok(Self {
+                elf_file: None,
+                num_funcs,
+                maco_file: Some(maco_file),
+                num_consts,
+                num_stackmaps,
+            })
+        } else {
+            panic!("OS unsupported.");
+        }
     }
 
     /// Returns the number of stackmap record entries in the stackmap section.
@@ -358,12 +463,20 @@ impl StackMapParser {
         self.num_funcs
     }
 
+    /// Returns the number of constant entries in the stackmap section.
+    pub fn num_consts(&self) -> u32 {
+        self.num_consts
+    }
+
     /// Check the stackmap header looks sane.
     fn check_header(cursor: &mut Cursor<&Vec<u8>>) -> SMParserResult<()> {
         // uint8: Stack Map Version
         let version = cursor.read_u8()?;
         if version != STACKMAP_VERSION {
-            let msg = format!("Expected stackmap format v{} but binary is v{}", STACKMAP_VERSION, version);
+            let msg = format!(
+                "Expected stackmap format v{} but binary is v{}",
+                STACKMAP_VERSION, version
+            );
             return Err(SMParserError::Other(msg));
         }
         // uint8: Reserved (expected to be 0)
@@ -407,14 +520,15 @@ impl StackMapParser {
     ///     }
     /// }
     pub fn iter_stackmaps(&self) -> SMRecIterator {
-        let start_pos = OFFS_STACK_SIZE_ENTRIES + u64::from(self.num_funcs) *
-            u64::from(SIZE_STACK_SIZE_ENTRY) + u64::from(self.num_consts) *
-            u64::from(SIZE_CONSTANT_ENTRY);
-        SMRecIterator{
-            elf_file: &self.elf_file,
+        let start_pos = OFFS_STACK_SIZE_ENTRIES
+            + u64::from(self.num_funcs) * u64::from(SIZE_STACK_SIZE_ENTRY)
+            + u64::from(self.num_consts) * u64::from(SIZE_CONSTANT_ENTRY);
+        SMRecIterator {
+            elf_file: self.elf_file.as_ref(),
+            maco_file: self.maco_file.as_ref(),
             cursor: None,
             start_pos,
-            num_stackmaps: self.num_stackmaps
+            num_stackmaps: self.num_stackmaps,
         }
     }
 
@@ -443,10 +557,11 @@ impl StackMapParser {
     ///         }
     ///     }
     /// }
-    pub fn iter_functions(&self) -> SMFuncIterator {
-        SMFuncIterator{
-            elf_file: &self.elf_file,
+    pub fn iter_functions(&mut self) -> SMFuncIterator {
+        SMFuncIterator {
+            elf_file: self.elf_file.as_ref(),
             cursor: None,
+            maco_file: self.maco_file.as_ref(),
             start_pos: OFFS_STACK_SIZE_ENTRIES,
             num_funcs: self.num_funcs,
         }
@@ -455,13 +570,13 @@ impl StackMapParser {
 
 #[cfg(test)]
 mod tests {
+    use super::{LocKind, LocOffset, SMFunc, SMLoc, SMRec, StackMapParser};
     use std::env;
     use std::iter::Iterator;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use super::{SMFunc, SMRec, SMLoc, StackMapParser, LocKind, LocOffset};
 
-    #[cfg(target_os="linux")]
+    #[cfg(target_os = "linux")]
     const MAKE: &str = "make";
     const LLVM_READOBJ_PATH: &str = "LLVM_READOBJ_PATH";
 
@@ -475,9 +590,9 @@ mod tests {
 
         // Run make.
         let res = Command::new(MAKE)
-                          .arg(path.to_str().unwrap())
-                          .output()
-                          .unwrap();
+            .arg(path.to_str().unwrap())
+            .output()
+            .unwrap();
         if !res.status.success() {
             eprintln!("build test input failed: \n>>> stdout");
             eprintln!("stdout: {}", String::from_utf8_lossy(&res.stdout));
@@ -509,7 +624,11 @@ mod tests {
         let stack_size = elems[3].trim().parse::<u64>().unwrap();
         let record_count = elems[5].trim().parse::<u64>().unwrap();
 
-        SMFunc { addr, stack_size, record_count }
+        SMFunc {
+            addr,
+            stack_size,
+            record_count,
+        }
     }
 
     fn parse_loc(line: &str) -> SMLoc {
@@ -527,15 +646,25 @@ mod tests {
                 let kind = LocKind::Register;
                 let dwarf_reg = rest[0].trim_start_matches("R#").parse::<u16>().unwrap();
                 let offset = LocOffset::I32(0);
-                SMLoc { kind, size, dwarf_reg, offset }
-            },
+                SMLoc {
+                    kind,
+                    size,
+                    dwarf_reg,
+                    offset,
+                }
+            }
             "Direct" => {
                 // e.g rest: ["R#0", "+", "-40"]
                 let kind = LocKind::Direct;
                 let dwarf_reg = rest[0].trim_start_matches("R#").parse::<u16>().unwrap();
                 let offset = LocOffset::I32(rest[2].parse::<i32>().unwrap());
-                SMLoc { kind, size, dwarf_reg, offset }
-            },
+                SMLoc {
+                    kind,
+                    size,
+                    dwarf_reg,
+                    offset,
+                }
+            }
             "Indirect" => {
                 // e.g rest: ["[R#0", "+", "-40]"]
                 let kind = LocKind::Indirect;
@@ -544,8 +673,13 @@ mod tests {
                     let n = rest[2].trim_end_matches("]").parse::<i32>().unwrap();
                     LocOffset::I32(n)
                 };
-                SMLoc { kind, size, dwarf_reg, offset }
-            },
+                SMLoc {
+                    kind,
+                    size,
+                    dwarf_reg,
+                    offset,
+                }
+            }
             "Constant" => {
                 let kind = LocKind::Constant;
                 let dwarf_reg = 0;
@@ -553,8 +687,13 @@ mod tests {
                     let c = rest[0].parse::<u32>().unwrap();
                     LocOffset::U32(c)
                 };
-                SMLoc { kind, size, dwarf_reg, offset }
-            },
+                SMLoc {
+                    kind,
+                    size,
+                    dwarf_reg,
+                    offset,
+                }
+            }
             "ConstantIndex" => {
                 let kind = LocKind::ConstIndex;
                 let dwarf_reg = 0;
@@ -562,8 +701,13 @@ mod tests {
                     let c = rest[0].trim_start_matches("#").parse::<i32>().unwrap();
                     LocOffset::I32(c)
                 };
-                SMLoc { kind, size, dwarf_reg, offset }
-            },
+                SMLoc {
+                    kind,
+                    size,
+                    dwarf_reg,
+                    offset,
+                }
+            }
             _ => panic!("Unidentified Location Kind"),
         }
     }
@@ -593,23 +737,31 @@ mod tests {
         // Individual location line, e.g:
         //  "#1: Register #R0, size: 8"
         // This cast to usize is safe, as num_locs is a u16
-        let locs = lines.take(num_locs as usize).map(|x| parse_loc(x)).collect();
+        let locs = lines
+            .take(num_locs as usize)
+            .map(|x| parse_loc(x))
+            .collect();
 
         // #TODO Live outs line
         lines.next();
 
-        SMRec { id, offset, num_locs, locs }
+        SMRec {
+            id,
+            offset,
+            num_locs,
+            locs,
+        }
     }
 
     // Parse the output of llvm-readelf to get expected outcomes.
     fn get_expected(path: &Path) -> (Vec<SMFunc>, Vec<SMRec>) {
         let readelf = env::var(LLVM_READOBJ_PATH)
-            .expect("Testing requires the LLVM_READOBJ_PATH environment variable to be set");         
+            .expect("Testing requires the LLVM_READOBJ_PATH environment variable to be set");
         let out = Command::new(readelf)
-                          .arg("-stackmap")
-                          .arg(path.to_str().unwrap())
-                          .output()
-                          .expect("failed to run llvm-readelf command");
+            .arg("-stackmap")
+            .arg(path.to_str().unwrap())
+            .output()
+            .expect("failed to run llvm-readelf command");
         assert!(out.status.success());
         let stdout = String::from_utf8(out.stdout).unwrap();
 

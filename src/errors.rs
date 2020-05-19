@@ -35,10 +35,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::error::Error;
-use std::fmt::{self, Formatter, Display};
-use std::io;
 use elf;
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
+use std::io;
 
 #[derive(Debug)]
 pub enum SMParserError {
@@ -53,9 +53,18 @@ pub enum SMParserError {
 impl Display for SMParserError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            SMParserError::ElfParse(e) => write!(f, "{:?}", e), // `e` doesn't implement `Display`.
-            SMParserError::IO(e) => Display::fmt(e, f),
-            SMParserError::Other(s) => write!(f, "{}", s),
+            SMParserError::ElfParse(e) => {
+                write!(f, "{:?}", e);
+                unimplemented!();
+            } // `e` doesn't implement `Display`.
+            SMParserError::IO(e) => {
+                Display::fmt(e, f);
+                unimplemented!();
+            }
+            SMParserError::Other(s) => {
+                write!(f, "{}", s);
+                unimplemented!();
+            }
         }
     }
 }
@@ -76,7 +85,6 @@ impl Error for SMParserError {
             SMParserError::Other(_) => None,
         }
     }
-
 }
 
 impl From<io::Error> for SMParserError {
@@ -91,4 +99,4 @@ impl From<elf::ParseError> for SMParserError {
     }
 }
 
-pub (crate) type SMParserResult<T> = Result<T, SMParserError>;
+pub(crate) type SMParserResult<T> = Result<T, SMParserError>;

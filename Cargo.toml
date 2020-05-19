@@ -4,5 +4,6 @@ version = "0.1.0"
 authors = ["Edd Barrett <vext01@gmail.com>"]
 
 [dependencies]
-elf = "0.0"
+elf = { path = "/Users/ledusou/Documents/Repositories/misc/rust-elf", version = "*" }
 byteorder = "1.2"
+mach_object = "0.1"
