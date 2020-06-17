@@ -53,18 +53,9 @@ pub enum SMParserError {
 impl Display for SMParserError {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            SMParserError::ElfParse(e) => {
-                write!(f, "{:?}", e);
-                unimplemented!();
-            } // `e` doesn't implement `Display`.
-            SMParserError::IO(e) => {
-                Display::fmt(e, f);
-                unimplemented!();
-            }
-            SMParserError::Other(s) => {
-                write!(f, "{}", s);
-                unimplemented!();
-            }
+            SMParserError::ElfParse(e) => write!(f, "{:?}", e), // `e` doesn't implement `Display`.
+            SMParserError::IO(e) => Display::fmt(e, f),
+            SMParserError::Other(s) => write!(f, "{}", s),
         }
     }
 }

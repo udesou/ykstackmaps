@@ -74,6 +74,7 @@ pub struct SMRec {
     pub offset: u32, // Stackmap offset from start of containing func.
     pub num_locs: u16,
     pub locs: Vec<SMLoc>,
+    pub pos_remainder: Option<u64>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -174,6 +175,7 @@ pub struct SMRecIterator<'a> {
     // need to return a `Result`.
     start_pos: u64, // Start position of the cursor.
     num_stackmaps: u32,
+    absolute_pos: bool,
 }
 
 impl<'a> Iterator for SMRecIterator<'a> {
@@ -189,7 +191,7 @@ impl<'a> Iterator for SMRecIterator<'a> {
                 self.cursor = Some(itry!(cursor_from_maco(
                     self.maco_file.unwrap(),
                     self.start_pos,
-                    false
+                    self.absolute_pos
                 )));
             } else if cfg!(target_os = "linux") {
                 self.cursor = Some(itry!(cursor_from_elf(
@@ -250,11 +252,28 @@ impl<'a> Iterator for SMRecIterator<'a> {
         // } -- End of this stackmap record.
 
         self.num_stackmaps -= 1;
+        let pos_remainder;
+        if self.num_stackmaps == 0 {
+            let cursor_pos = cursor.position();
+            match StackMapParser::check_header(&mut cursor) {
+                Ok(_) => {
+                    // there is still another Stackmap to be read at position cursor_pos
+                    pos_remainder = Some(cursor_pos)
+                }
+                Err(_) => {
+                    pos_remainder = None;
+                }
+            }
+        } else {
+            pos_remainder = None
+        }
+
         Some(Ok(SMRec {
             id,
             offset,
             num_locs,
             locs,
+            pos_remainder,
         }))
     }
 }
@@ -335,6 +354,7 @@ pub struct SMFuncIterator<'a> {
     // need to return a `Result`.
     start_pos: u64, // Start position of the cursor.
     num_funcs: u32,
+    absolute_pos: bool,
 }
 
 impl<'a> Iterator for SMFuncIterator<'a> {
@@ -350,7 +370,7 @@ impl<'a> Iterator for SMFuncIterator<'a> {
                 self.cursor = Some(itry!(cursor_from_maco(
                     self.maco_file.unwrap(),
                     self.start_pos,
-                    false
+                    self.absolute_pos
                 )));
             } else if cfg!(target_os = "linux") {
                 self.cursor = Some(itry!(cursor_from_elf(
@@ -437,10 +457,64 @@ impl StackMapParser {
             // uint32: NumRecords
             num_stackmaps = cursor.read_u32::<NativeEndian>()?;
 
-            println!(
-                "fns = {}, consts = {}, stms = {}",
-                num_funcs, num_consts, num_stackmaps
-            );
+            Ok(Self {
+                elf_file: None,
+                num_funcs,
+                maco_file: Some(maco_file),
+                num_consts,
+                num_stackmaps,
+            })
+        } else {
+            panic!("OS unsupported.");
+        }
+    }
+
+    pub fn new_from_position(path: &Path, start_pos: u64) -> SMParserResult<Self> {
+        let num_funcs;
+        let num_consts;
+        let num_stackmaps;
+
+        if cfg!(target_os = "linux") {
+            let elf_file = elf::File::open_path(path)?;
+            {
+                let mut cursor = cursor_from_elf(&elf_file, start_pos)?;
+                Self::check_header(&mut cursor)?;
+
+                // Read in table sizes.
+                // uint32: NumFunctions
+                num_funcs = cursor.read_u32::<NativeEndian>()?;
+                // uint32: NumConstants
+                num_consts = cursor.read_u32::<NativeEndian>()?;
+                // uint32: NumRecords
+                num_stackmaps = cursor.read_u32::<NativeEndian>()?;
+            }
+
+            Ok(Self {
+                elf_file: Some(elf_file),
+                num_funcs,
+                maco_file: None,
+                num_consts,
+                num_stackmaps,
+            })
+        } else if cfg!(target_os = "macos") {
+            use std::fs::File;
+            use std::io::{self, Cursor, Read, Seek, SeekFrom};
+
+            let mut maco_file = MacOFile { buf: Vec::new() };
+            let mut file = File::open(path)?;
+            let size = file.read_to_end(&mut maco_file.buf).unwrap();
+
+            let mut cursor = cursor_from_maco(&maco_file, start_pos, true)?;
+            Self::check_header(&mut cursor)?;
+
+            // Read in table sizes.
+            // uint32: NumFunctions
+            num_funcs = cursor.read_u32::<NativeEndian>()?;
+            // uint32: NumConstants
+            num_consts = cursor.read_u32::<NativeEndian>()?;
+            // uint32: NumRecords
+            num_stackmaps = cursor.read_u32::<NativeEndian>()?;
+
             Ok(Self {
                 elf_file: None,
                 num_funcs,
@@ -469,7 +543,7 @@ impl StackMapParser {
     }
 
     /// Check the stackmap header looks sane.
-    fn check_header(cursor: &mut Cursor<&Vec<u8>>) -> SMParserResult<()> {
+    pub fn check_header(cursor: &mut Cursor<&Vec<u8>>) -> SMParserResult<()> {
         // uint8: Stack Map Version
         let version = cursor.read_u8()?;
         if version != STACKMAP_VERSION {
@@ -529,6 +603,22 @@ impl StackMapParser {
             cursor: None,
             start_pos,
             num_stackmaps: self.num_stackmaps,
+            absolute_pos: false,
+        }
+    }
+
+    pub fn iter_stackmaps_from_pos(&self, start_pos: u64) -> SMRecIterator {
+        let start_pos = start_pos
+            + OFFS_STACK_SIZE_ENTRIES
+            + u64::from(self.num_funcs) * u64::from(SIZE_STACK_SIZE_ENTRY)
+            + u64::from(self.num_consts) * u64::from(SIZE_CONSTANT_ENTRY);
+        SMRecIterator {
+            elf_file: self.elf_file.as_ref(),
+            maco_file: self.maco_file.as_ref(),
+            cursor: None,
+            start_pos,
+            num_stackmaps: self.num_stackmaps,
+            absolute_pos: true,
         }
     }
 
@@ -564,6 +654,20 @@ impl StackMapParser {
             maco_file: self.maco_file.as_ref(),
             start_pos: OFFS_STACK_SIZE_ENTRIES,
             num_funcs: self.num_funcs,
+            absolute_pos: false,
+        }
+    }
+
+    pub fn iter_functions_from_pos(&mut self, start_pos: u64) -> SMFuncIterator {
+        let start_pos = OFFS_STACK_SIZE_ENTRIES + start_pos;
+
+        SMFuncIterator {
+            elf_file: self.elf_file.as_ref(),
+            cursor: None,
+            maco_file: self.maco_file.as_ref(),
+            start_pos,
+            num_funcs: self.num_funcs,
+            absolute_pos: true,
         }
     }
 }
@@ -750,6 +854,7 @@ mod tests {
             offset,
             num_locs,
             locs,
+            parser_remainder: None,
         }
     }
 
