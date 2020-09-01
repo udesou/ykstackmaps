@@ -51,7 +51,6 @@ pub(crate) fn cursor_from_elf(
     let sec_res = elf_file.get_section(STACKMAP_SECTION_NAME);
 
     if let Some(sec) = sec_res {
-        println!("sec addr: {:x}", sec.shdr.offset);
         let mut cursor = Cursor::new(&sec.data);
         cursor.seek(SeekFrom::Start(start_pos))?;
         Ok(cursor)
